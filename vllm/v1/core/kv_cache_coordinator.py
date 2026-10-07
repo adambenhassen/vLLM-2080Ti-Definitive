@@ -1105,7 +1105,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 # it, landing back at the candidate length. No margin for
                 # mamba: its finder never drops (draft models have no mamba
                 # layers), so the hit would grow past the candidate.
-                if drop_eagle_block and not isinstance(spec, MambaSpec):
+                if drop_eagle_block:  # club-3090 pr48375 margin: mamba drops too
                     eagle_margin = (
                         self.hash_block_size
                         if self.enable_partial_hash_hits

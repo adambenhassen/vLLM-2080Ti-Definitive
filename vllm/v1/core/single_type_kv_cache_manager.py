@@ -1538,6 +1538,13 @@ class MambaManager(SingleTypeKVCacheManager):
             return computed_blocks, hit_length
 
         max_num_blocks = max_length // block_size
+        if drop_eagle_block and max_num_blocks > 0:
+            # club-3090 vendored vllm#48375 (see patches.yml). EAGLE/MTP: drop the
+            # final matched page -- its recurrent-state snapshot may reflect draft
+            # tokens that verification later rejected. Mamba keeps only the
+            # rightmost real block, so lower the search ceiling by one page
+            # instead of popping (a pop would delete the state block itself).
+            max_num_blocks -= 1
         # Search from right to left and early stop when a match is found.
         for i in range(max_num_blocks - 1, -1, -1):
             if cached_block := block_pool.get_cached_block(
