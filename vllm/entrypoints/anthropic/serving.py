@@ -115,6 +115,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        enable_per_request_metrics: bool = False,  # club-3090 local: anthropic stream metrics
     ):
         super().__init__(
             engine_client=engine_client,
@@ -131,6 +132,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             enable_prompt_tokens_details=enable_prompt_tokens_details,
             enable_force_include_usage=enable_force_include_usage,
             default_chat_template_kwargs=default_chat_template_kwargs,
+            enable_per_request_metrics=enable_per_request_metrics,  # club-3090 local: anthropic stream metrics
         )
         self.stop_reason_map = {
             "stop": "end_turn",
@@ -852,6 +854,14 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 usage=_build_anthropic_usage(origin_chunk.usage),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)
+                            # club-3090 local: anthropic stream metrics (llama-swap rates)
+                            # Anthropic input_tokens excludes cached tokens; llama-swap reads
+                            # prompt_tokens first, so add the OpenAI-style total for it.
+                            if origin_chunk.usage is not None and data.count('"usage":{') == 1:
+                                data = data.replace('"usage":{', '"usage":{"prompt_tokens":%d,' % origin_chunk.usage.prompt_tokens, 1)
+                            _m = getattr(origin_chunk, "metrics", None)
+                            if _m is not None and data.endswith("}"):
+                                data = data[:-1] + ',"metrics":' + _m.model_dump_json(exclude_none=True) + "}"
                             yield wrap_data_with_event(data, "message_delta")
                             continue
 
