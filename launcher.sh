@@ -938,6 +938,7 @@ NON_INTERACTIVE_BOOLEAN_KEYS=(
   VLLM_INT8KV_FA_CONTINUATION_DEQUANT
   VLLM_INT8KV_FA_PREFILL
   SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH
+  SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP
   SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION
 )
 
@@ -1393,6 +1394,7 @@ save_manager_state() {
     printf 'SPECULATIVE_ATTENTION_BACKEND=%q\n' "${SPECULATIVE_ATTENTION_BACKEND:-}"
     printf 'SPECULATIVE_KV_CACHE_DTYPE=%q\n' "${SPECULATIVE_KV_CACHE_DTYPE:-}"
     printf 'SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH=%q\n' "${SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH:-0}"
+    printf 'SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP=%q\n' "${SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP:-0}"
     printf 'SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION=%q\n' "${SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION:-0}"
     printf 'SPECULATIVE_DRAFT_SAMPLE_METHOD=%q\n' "${SPECULATIVE_DRAFT_SAMPLE_METHOD:-greedy}"
     printf 'PER_REQUEST_SPEC_DECODE_METRICS=%q\n' "${PER_REQUEST_SPEC_DECODE_METRICS:-}"
@@ -2174,6 +2176,7 @@ profile_summary() {
   SPECULATIVE_ATTENTION_BACKEND
   SPECULATIVE_KV_CACHE_DTYPE
   SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH
+    SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP
     SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION
     VLLM_ALLOW_LONG_MAX_MODEL_LEN
     CUSTOM_ALL_REDUCE_MODE
@@ -4574,10 +4577,12 @@ build_generated_speculative_config() {
   local kv_cache_dtype=${SPECULATIVE_KV_CACHE_DTYPE:-}
   local draft_sample_method=${5:-greedy}
 
-  python3 - "$method" "$tokens" "${SPECULATIVE_MODEL:-}" \
+  SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP="${SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP:-0}" \
+    python3 - "$method" "$tokens" "${SPECULATIVE_MODEL:-}" \
     "${SPECULATIVE_DRAFT_TP_SIZE:-}" "${SPECULATIVE_MAX_MODEL_LEN:-}" \
     "$backend" "${SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH:-0}" "$use_local_argmax" "$kv_cache_dtype" "$draft_sample_method" <<'PY'
 import json
+import os
 import sys
 
 method, tokens, model, draft_tp, max_model_len, backend, disable_padded, use_local_argmax, kv_cache_dtype, draft_sample_method = sys.argv[1:]
@@ -4601,6 +4606,9 @@ if method == "dflash":
         cfg["draft_sample_method"] = draft_sample_method
     if disable_padded in {"1", "true", "True", "yes", "on"}:
         cfg["disable_padded_drafter_batch"] = True
+    # DFlash drafts from its own KV cache, so the EAGLE trailing prefix-cache block drop only costs cache hits.
+    if os.environ.get("SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP", "0") in {"1", "true", "True", "yes", "on"}:
+        cfg["disable_eagle_block_drop"] = True
 if use_local_argmax in {"1", "true", "True", "yes", "on"}:
     cfg["use_local_argmax_reduction"] = True
 
@@ -6037,6 +6045,7 @@ prepare_runtime_defaults() {
   configure_automatic_prefill_batch_barrier
   MTP_K=${MTP_K:-0}
   SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH=${SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH:-0}
+  SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP=${SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP:-0}
   SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION=${SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION:-0}
   local selected_gpu_count effective_pp_size
   effective_pp_size=${PP_SIZE:-1}
