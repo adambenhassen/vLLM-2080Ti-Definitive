@@ -360,6 +360,33 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
+    """Rows [q_size:] of the qkv projection as a dense bf16 matrix.
+
+    club-3090 vendored fix for vllm#51581 (see patches.yml). For a
+    compressed-tensors W4A16/W8A16 (pack-quantized, symmetric, group) qkv_proj this
+    runs from load_weights, i.e. BEFORE the Marlin repack, so weight_packed /
+    weight_scale are still in the plain checkpoint layout and can be dequantized
+    here. An already-dense 2-D .weight short-circuits, so an unquantized drafter
+    takes the stock path.
+    """
+    qkv = attn.qkv_proj
+    w = getattr(qkv, "weight", None)
+    if w is not None and w.dim() == 2:
+        return w[attn.q_size:]
+    packed, scale = qkv.weight_packed, qkv.weight_scale
+    # (weight_shape holds only the last-loaded shard of a fused qkv; use the tensors.)
+    out_f, in_f = int(packed.shape[0]), int(qkv.input_size)
+    bits = 32 * packed.shape[1] // in_f
+    from compressed_tensors.compressors.pack_quantized.base import unpack_from_int32
+    q = unpack_from_int32(packed.data, bits, torch.Size([out_f, in_f]), packed_dim=1)
+    group = in_f // scale.shape[1]
+    dense = (q.to(torch.float32).reshape(out_f, in_f // group, group)
+             * scale.to(torch.float32)[..., None]).reshape(out_f, in_f)
+    out_dtype = scale.dtype if scale.dtype.is_floating_point else torch.bfloat16
+    return dense.to(out_dtype)[attn.q_size:]
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -474,7 +501,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [_dense_kv_rows(a) for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
