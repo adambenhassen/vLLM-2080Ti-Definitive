@@ -332,6 +332,27 @@ class Sm75DFlash2ResidualNorm(nn.Module):
         return output if residual is None else (output, next_state)
 
 
+def _dense_local_weight(layer: nn.Module) -> torch.Tensor | None:
+    """This rank's 2-D weight of a linear layer, dequantizing a compressed-tensors pack-quantized
+    (symmetric, group) layer that is still in checkpoint layout (before process_weights_after_loading)."""
+    weight = getattr(layer, "weight", None)
+    if isinstance(weight, torch.Tensor) and weight.ndim == 2:
+        return weight
+    packed = getattr(layer, "weight_packed", None)
+    scale = getattr(layer, "weight_scale", None)
+    if packed is None or scale is None:
+        return None
+    from compressed_tensors.compressors.pack_quantized.base import unpack_from_int32
+
+    out_f = int(packed.shape[0])
+    in_f = int(layer.input_size_per_partition)
+    bits = 32 * int(packed.shape[1]) // in_f
+    q = unpack_from_int32(packed.data, bits, torch.Size([out_f, in_f]), packed_dim=1)
+    group = in_f // int(scale.shape[1])
+    return (q.to(torch.float32).reshape(out_f, in_f // group, group)
+            * scale.to(torch.float32)[..., None]).reshape(out_f, in_f)
+
+
 class Sm75DFlash2MLP(nn.Module):
     """SM75 implementation of DFlash2's BF16-trained SwiGLU transport."""
 
@@ -344,7 +365,7 @@ class Sm75DFlash2MLP(nn.Module):
 
     def initialize_down_projection_bound(self) -> None:
         """Derive a finite FP16 partial-sum bound from loaded local weights."""
-        weight = getattr(self.down_proj, "weight", None)
+        weight = _dense_local_weight(self.down_proj)
         if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
             raise ValueError(
                 "DFlash2 SM75 transport requires an unquantized 2-D down projection."
