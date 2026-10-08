@@ -49,6 +49,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.utils import tensor_data
 
 if TYPE_CHECKING:
@@ -1186,9 +1187,34 @@ def _dflash_group_capacities(
     # length. Sizing them for a single request leaves room for one sequence,
     # so with max_num_seqs > 1 every other request waits. Full attention stays
     # sized for one max_model_len request: concurrent sequences share it.
+    # With a dynamic draft schedule the scheduler caps each request at the
+    # draft count for the current concurrency (see Scheduler
+    # `_update_spec_budgets`), so full concurrency needs pages for that count.
     max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    spec_tokens_at_max_seqs: int | None = None
+    schedule = getattr(
+        vllm_config.speculative_config, "num_speculative_tokens_per_batch_size", None
+    )
+    if schedule:
+        spec_tokens_at_max_seqs = build_dynamic_sd_schedule_lookup(
+            schedule,
+            vllm_max_batch_size=max_num_seqs,
+            vllm_num_speculative_tokens=vllm_config.num_speculative_tokens,
+        )[max_num_seqs]
     requirements = [
-        max(req, max_num_seqs * (2 + group.kv_cache_spec.num_speculative_blocks))
+        max(
+            req,
+            max_num_seqs
+            * (
+                2
+                + min(
+                    group.kv_cache_spec.num_speculative_blocks,
+                    spec_tokens_at_max_seqs
+                    if spec_tokens_at_max_seqs is not None
+                    else group.kv_cache_spec.num_speculative_blocks,
+                )
+            ),
+        )
         if isinstance(group.kv_cache_spec, MambaSpec)
         else req * max_num_seqs
         if isinstance(group.kv_cache_spec, SlidingWindowSpec)

@@ -53,6 +53,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -319,6 +320,25 @@ class Scheduler(SchedulerInterface):
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+
+        # Dynamic draft length on Mamba "align" groups: every speculative token
+        # needs a state page per sequence. Cap each request at the schedule's
+        # draft count for the current concurrency and hold only that many
+        # pages, so the pools fit max_num_seqs sequences at the smallest count
+        # while a lone request still drafts num_speculative_tokens.
+        self._spec_budget_managers: list[MambaManager] = []
+        if self.dynamic_sd_lookup is not None:
+            self._spec_budget_managers = [
+                manager
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(manager, MambaManager)
+                and manager.mamba_cache_mode == "align"
+                and manager.num_speculative_blocks > 0
+            ]
+        # Requests capped below num_spec_tokens, and the step at which a cap was
+        # lowered for a running request whose pages are still held.
+        self._spec_caps: dict[str, int] = {}
+        self._pending_spec_shrinks: dict[str, int] = {}
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -601,8 +621,76 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _spec_tokens_for(self, num_seqs: int) -> int:
+        assert self.dynamic_sd_lookup is not None
+        num_seqs = min(max(num_seqs, 1), len(self.dynamic_sd_lookup) - 1)
+        return self.dynamic_sd_lookup[num_seqs]
+
+    def _set_spec_cap(self, request: Request, cap: int) -> None:
+        if cap >= self.num_spec_tokens:
+            self._spec_caps.pop(request.request_id, None)
+            return
+        self._spec_caps[request.request_id] = cap
+        if len(request.spec_token_ids) > cap:
+            request.spec_token_ids = request.spec_token_ids[:cap]
+
+    def _update_spec_budgets(self) -> None:
+        """Shrink running requests' draft length when another request waits,
+        and grow it back for a request running alone."""
+        if not self._spec_budget_managers:
+            return
+        # A lowered cap was scheduled in an earlier step, so no step that is
+        # scheduled from now on verifies more drafts: release the extra pages.
+        for req_id, step in list(self._pending_spec_shrinks.items()):
+            if step >= self.current_step:
+                continue
+            del self._pending_spec_shrinks[req_id]
+            request = self.requests.get(req_id)
+            if request is None or request.status != RequestStatus.RUNNING:
+                continue
+            cap = self._spec_caps.get(req_id, self.num_spec_tokens)
+            for manager in self._spec_budget_managers:
+                manager.resize_spec_budget(req_id, cap)
+        if self.waiting and len(self.running) < self.max_num_running_reqs:
+            target = self._spec_tokens_for(len(self.running) + 1)
+            for request in self.running:
+                req_id = request.request_id
+                if self._spec_caps.get(req_id, self.num_spec_tokens) > target:
+                    self._set_spec_cap(request, target)
+                    self._pending_spec_shrinks[req_id] = self.current_step
+        elif not self.waiting:
+            target = self._spec_tokens_for(len(self.running))
+            for request in self.running:
+                req_id = request.request_id
+                cap = self._spec_caps.get(req_id, self.num_spec_tokens)
+                if cap >= target or req_id in self._pending_spec_shrinks:
+                    continue
+                if all(
+                    manager.num_blocks_to_grow_spec_budget(req_id, target)
+                    <= manager.block_pool.get_num_free_blocks()
+                    for manager in self._spec_budget_managers
+                ):
+                    for manager in self._spec_budget_managers:
+                        manager.resize_spec_budget(req_id, target)
+                    self._set_spec_cap(request, target)
+        for request in self.running:
+            cap = self._spec_caps.get(request.request_id)
+            if cap is not None and len(request.spec_token_ids) > cap:
+                request.spec_token_ids = request.spec_token_ids[:cap]
+
+    def _take_spec_budget_row_updates(self) -> dict[str, tuple[list[int], ...]]:
+        rows: set[str] = set()
+        for manager in self._spec_budget_managers:
+            rows |= manager.take_rewritten_rows()
+        return {
+            req_id: self.kv_cache_manager.get_block_ids(req_id)
+            for req_id in rows
+            if req_id in self.requests
+        }
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        self._update_spec_budgets()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1303,6 +1391,15 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
+                if self._spec_budget_managers:
+                    # Admitted next to running requests: start at the draft
+                    # count for that concurrency, with only those state pages.
+                    cap = self._spec_tokens_for(
+                        len(self.running) + len(self.waiting)
+                    )
+                    for manager in self._spec_budget_managers:
+                        manager.set_initial_spec_budget(request_id, cap)
+                    self._set_spec_cap(request, cap)
                 reserved_blocks = 0
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
@@ -1604,6 +1701,10 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+        if self._spec_budget_managers and (
+            row_updates := self._take_spec_budget_row_updates()
+        ):
+            scheduler_output.block_table_updates = row_updates
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -2801,6 +2902,8 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self._prefill_barrier_admission_blocked.discard(request_id)
+        self._spec_caps.pop(request_id, None)
+        self._pending_spec_shrinks.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

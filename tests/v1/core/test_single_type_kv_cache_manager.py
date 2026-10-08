@@ -145,6 +145,81 @@ def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
         manager._relocate_speculative_block([pinned_block], 0)
 
 
+def _spec_budget_manager(num_spec: int = 3, block_size: int = 4):
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=num_spec,
+    )
+    pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=4)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    return manager, pool
+
+
+def _spec_window(manager: MambaManager, request_id: str) -> list[bool]:
+    blocks = manager.req_to_blocks[request_id]
+    return [not b.is_null for b in blocks[-(1 + manager.num_speculative_blocks) :]]
+
+
+def _allocate(manager: MambaManager, request_id: str, num_tokens: int) -> int:
+    pool = manager.block_pool
+    free = pool.get_num_free_blocks()
+    need = manager.get_num_blocks_to_allocate(
+        request_id,
+        num_tokens=num_tokens,
+        new_computed_blocks=[],
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=num_tokens,
+    )
+    manager.allocate_new_blocks(
+        request_id, num_tokens=num_tokens, num_tokens_main_model=num_tokens
+    )
+    taken = free - pool.get_num_free_blocks()
+    assert taken <= need
+    return taken
+
+
+def test_mamba_spec_budget_keeps_window_width_with_null_tail():
+    manager, _ = _spec_budget_manager()
+    manager.set_initial_spec_budget("r", 1)
+    # State plus one draft page; the window still spans 1 + 3 columns.
+    assert _allocate(manager, "r", 6) == 2
+    assert _spec_window(manager, "r") == [True, True, False, False]
+    assert not manager.take_rewritten_rows()
+    # Crossing a block moves the window one column: the column entering the
+    # budget gets the one new page and the appended column stays null.
+    assert _allocate(manager, "r", 9) == 1
+    assert _spec_window(manager, "r") == [True, True, False, False]
+    assert manager.take_rewritten_rows() == {"r"}
+
+
+def test_mamba_spec_budget_resize_frees_and_regrows_tail_pages():
+    manager, pool = _spec_budget_manager()
+    assert _allocate(manager, "r", 6) == 4
+    assert _spec_window(manager, "r") == [True, True, True, True]
+    free = pool.get_num_free_blocks()
+    manager.resize_spec_budget("r", 1)
+    assert pool.get_num_free_blocks() == free + 2
+    assert _spec_window(manager, "r") == [True, True, False, False]
+    assert manager.take_rewritten_rows() == {"r"}
+    assert manager.num_blocks_to_grow_spec_budget("r", 3) == 2
+    manager.resize_spec_budget("r", 3)
+    assert pool.get_num_free_blocks() == free
+    assert _spec_window(manager, "r") == [True, True, True, True]
+    assert manager.take_rewritten_rows() == {"r"}
+    # The full budget is the default and needs no bookkeeping.
+    assert "r" not in manager._spec_budgets
+
+
 def test_mamba_checkpoint_requires_backend_exporter():
     """A reservation alone must not publish an unwritten Mamba state page."""
     spec = MambaSpec(

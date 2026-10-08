@@ -1483,6 +1483,14 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            # Speculative state pages per request when fewer than
+            # `num_speculative_blocks` (dynamic draft length). The window keeps
+            # its full width so workers gather the same columns; columns past
+            # the budget point at the null block.
+            self._spec_budgets: dict[str, int] = {}
+            # Running requests whose worker block table row changed in place
+            # and must be rewritten (the worker table is otherwise append-only).
+            self._rewritten_rows: set[str] = set()
 
     @classmethod
     def find_longest_cache_hit(
@@ -1811,7 +1819,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if not (checkpoint_block and blocks_allocated):
                     num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                     if not blocks_allocated:
-                        num_new_blocks += self.num_speculative_blocks
+                        num_new_blocks += self._spec_budget(request_id)
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
@@ -1892,6 +1900,33 @@ class MambaManager(SingleTypeKVCacheManager):
                         else:
                             break
                 num_new_blocks = max(num_required_blocks - len(req_blocks), 0)
+                budget = self._spec_budget(request_id)
+                if budget < self.num_speculative_blocks:
+                    num_append = num_new_blocks
+                    final_len = len(req_blocks) + num_append
+                    window_start = final_len - 1 - self.num_speculative_blocks
+                    tail_start = final_len - self.num_speculative_blocks + budget
+                    # Window columns up to the budget need real pages; columns
+                    # past it hold none. Reuse scratch pages that landed past
+                    # the budget (window slide, relocation) before allocating.
+                    fill_cols = [
+                        c
+                        for c in range(
+                            max(window_start, 0), min(tail_start, len(req_blocks))
+                        )
+                        if req_blocks[c].is_null
+                    ]
+                    spare_cols = [
+                        c
+                        for c in range(max(tail_start, 0), len(req_blocks))
+                        if not req_blocks[c].is_null
+                    ]
+                    num_append_real = max(
+                        min(final_len, tail_start) - len(req_blocks), 0
+                    )
+                    num_new_blocks = num_append_real + max(
+                        len(fill_cols) - len(spare_cols), 0
+                    )
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
@@ -1938,6 +1973,33 @@ class MambaManager(SingleTypeKVCacheManager):
                     else:
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
+                if budget < self.num_speculative_blocks:
+                    returned_prefix = returned_blocks[
+                        : len(returned_blocks) - (len(req_blocks) - prev_block_len)
+                    ]
+                    sources: list[KVCacheBlock] = []
+                    for c in spare_cols:
+                        block = req_blocks[c]
+                        assert self.block_pool.is_block_writable(block), (
+                            "Speculative Mamba blocks past the budget must be "
+                            "exclusively owned and unhashed"
+                        )
+                        sources.append(block)
+                        req_blocks[c] = self._null_block
+                    sources.extend(new_blocks)
+                    for c in fill_cols:
+                        req_blocks[c] = sources.pop(0)
+                    appended = sources[:num_append_real] + [self._null_block] * (
+                        num_append - num_append_real
+                    )
+                    if leftover := sources[num_append_real:]:
+                        self.block_pool.free_blocks(leftover)
+                    if any(c < prev_block_len for c in fill_cols + spare_cols):
+                        self._rewritten_rows.add(request_id)
+                    req_blocks.extend(appended)
+                    self._allocated_block_reqs.add(request_id)
+                    self._partial_hit_reqs.pop(request_id, None)
+                    return returned_prefix + req_blocks[prev_block_len:]
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
@@ -1948,12 +2010,81 @@ class MambaManager(SingleTypeKVCacheManager):
         self, req_blocks: list[KVCacheBlock], block_idx: int
     ) -> None:
         block = req_blocks[block_idx]
+        if block.is_null:
+            # A column past the request's speculative budget has no page.
+            req_blocks.append(block)
+            return
         assert self.block_pool.is_block_writable(block), (
             "Speculative Mamba blocks must be exclusively owned and unhashed "
             "before relocation"
         )
         req_blocks.append(block)
         req_blocks[block_idx] = self._null_block
+
+    def _spec_budget(self, request_id: str) -> int:
+        return self._spec_budgets.get(request_id, self.num_speculative_blocks)
+
+    def set_initial_spec_budget(self, request_id: str, budget: int) -> None:
+        """Set the speculative state pages of a request without blocks yet."""
+        assert self.mamba_cache_mode == "align"
+        assert request_id not in self._allocated_block_reqs
+        if budget >= self.num_speculative_blocks:
+            self._spec_budgets.pop(request_id, None)
+        else:
+            self._spec_budgets[request_id] = budget
+
+    def num_blocks_to_grow_spec_budget(self, request_id: str, budget: int) -> int:
+        """Pages `resize_spec_budget(request_id, budget)` takes from the pool."""
+        if request_id not in self._allocated_block_reqs:
+            return 0
+        return max(budget - self._spec_budget(request_id), 0)
+
+    def resize_spec_budget(self, request_id: str, budget: int) -> None:
+        """Change the speculative state pages of a running request.
+
+        The window is always the last `1 + num_speculative_blocks` columns, so
+        speculative column j (1-based) is `len(blocks) - num_speculative_blocks
+        - 1 + j`. A shrink must only run once no in-flight step verifies more
+        than `budget` draft tokens; the caller enforces that.
+        """
+        assert self.mamba_cache_mode == "align"
+        budget = min(budget, self.num_speculative_blocks)
+        old = self._spec_budget(request_id)
+        if budget == old:
+            return
+        if request_id in self._allocated_block_reqs:
+            blocks = self.req_to_blocks[request_id]
+            base = len(blocks) - self.num_speculative_blocks
+            if budget < old:
+                freed: list[KVCacheBlock] = []
+                for c in range(base + budget, base + old):
+                    block = blocks[c]
+                    if block.is_null:
+                        continue
+                    assert self.block_pool.is_block_writable(block), (
+                        "Speculative Mamba blocks must be exclusively owned and "
+                        "unhashed before release"
+                    )
+                    freed.append(block)
+                    blocks[c] = self._null_block
+                if freed:
+                    self.block_pool.free_blocks(freed)
+            else:
+                cols = [
+                    c for c in range(base + old, base + budget) if blocks[c].is_null
+                ]
+                for c, block in zip(cols, self.block_pool.get_new_blocks(len(cols))):
+                    blocks[c] = block
+            self._rewritten_rows.add(request_id)
+        if budget >= self.num_speculative_blocks:
+            self._spec_budgets.pop(request_id, None)
+        else:
+            self._spec_budgets[request_id] = budget
+
+    def take_rewritten_rows(self) -> set[str]:
+        rows = self._rewritten_rows
+        self._rewritten_rows = set()
+        return rows
 
     def finalize_partial_tail_offload(
         self,
@@ -1978,6 +2109,8 @@ class MambaManager(SingleTypeKVCacheManager):
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
+            self._spec_budgets.pop(request_id, None)
+            self._rewritten_rows.discard(request_id)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than
