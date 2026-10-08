@@ -3272,6 +3272,61 @@ def test_dflash_pools_hold_state_pages_for_every_sequence():
     )
 
 
+def test_dflash_mamba_pools_cover_peak_of_dynamic_draft_schedule():
+    """Size for the largest n * (2 + k(n)), not just n = max_num_seqs."""
+    num_spec = 4
+    target_block_size = 2160
+    target_page_size = target_block_size * 776
+    target_spec = FullAttentionSpec(
+        block_size=target_block_size,
+        num_kv_heads=1,
+        head_size=388,
+        dtype=torch.uint8,
+    )
+    mamba_spec = new_mamba_spec(
+        block_size=target_block_size,
+        shapes=((target_page_size,),),
+        dtypes=(torch.uint8,),
+        num_speculative_blocks=num_spec,
+        mamba_cache_mode="align",
+    )
+    specs = {
+        **{f"model.layers.{i}.full_attn": target_spec for i in range(16)},
+        **{f"model.layers.{i}.linear_attn": mamba_spec for i in range(16, 64)},
+    }
+    config = _dflash_aligned_hybrid_grouping_config()
+    config.scheduler_config.max_num_seqs = 3
+    config.num_speculative_tokens = num_spec
+    # Two sequences at 3 drafts need 2 * (2 + 3) = 10 pages, more than three
+    # sequences at 1 draft (3 * (2 + 1) = 9).
+    config.speculative_config.num_speculative_tokens_per_batch_size = [
+        [1, 1, 4],
+        [2, 2, 3],
+        [3, 3, 1],
+    ]
+    groups = get_kv_cache_groups(config, specs)
+    mamba_ids = [
+        i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    assert mamba_ids
+    pages = [
+        10
+        if i in mamba_ids
+        else kv_cache_utils.cdiv(
+            g.kv_cache_spec.max_memory_usage_bytes(config),
+            g.kv_cache_spec.page_size_bytes,
+        )
+        for i, g in enumerate(groups)
+    ]
+    available_memory = sum(
+        (n + 1) * kv_cache_utils._group_page_bytes(g) for n, g in zip(pages, groups)
+    )
+    capacities = kv_cache_utils._dflash_group_capacities(
+        config, groups, available_memory
+    )
+    assert all(capacities[i] - 1 >= 10 for i in mamba_ids)
+
+
 def test_dflash_aligned_hybrid_identifies_local_draft_layer_names():
     """DFlash still separates the draft cache when its KV name is local."""
     target_block_size = 2160
