@@ -194,6 +194,10 @@ validate_configured_kv_concurrency() {
 
   required=$((max_num_seqs * max_model_len))
   if (( total < required )); then
+    if [[ "${ALLOW_KV_OVERCOMMIT:-0}" == "1" ]]; then
+      echo "WARNING: KV overcommit allowed: $total tokens < $max_num_seqs x $max_model_len = $required; requests share the pool and may queue or preempt." >&2
+      return 0
+    fi
     echo "ERROR: configured concurrency cannot be admitted by the allocated GPU KV cache." >&2
     echo "  GPU KV tokens: $total" >&2
     echo "  Required:      $max_num_seqs x $max_model_len = $required" >&2
