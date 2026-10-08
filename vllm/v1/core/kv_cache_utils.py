@@ -1180,9 +1180,30 @@ def _dflash_group_capacities(
         )
         for group in kv_cache_groups
     ]
+    # Mamba "align" state pages (one active page, one in-flight prefill
+    # checkpoint and one verifier page per speculative token) and the draft's
+    # sliding-window pages are held per running sequence, whatever the prompt
+    # length. Sizing them for a single request leaves room for one sequence,
+    # so with max_num_seqs > 1 every other request waits. Full attention stays
+    # sized for one max_model_len request: concurrent sequences share it.
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    requirements = [
+        max(req, max_num_seqs * (2 + group.kv_cache_spec.num_speculative_blocks))
+        if isinstance(group.kv_cache_spec, MambaSpec)
+        else req * max_num_seqs
+        if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        else req
+        for req, group in zip(requirements, kv_cache_groups)
+    ]
     page_bytes = [_group_page_bytes(group) for group in kv_cache_groups]
     null_bytes = sum(page_bytes)
     required_bytes = sum(req * page for req, page in zip(requirements, page_bytes))
+    logger.info(
+        "DFlash2 KV pools: requirements=%s page_bytes=%s available=%d",
+        requirements,
+        page_bytes,
+        available_memory,
+    )
     if required_bytes + null_bytes > available_memory:
         raise ValueError(
             "Insufficient memory for the requested DFlash2 KV cache groups: "
@@ -1213,6 +1234,7 @@ def _dflash_group_capacities(
             break
         index = max(candidates, key=lambda i: page_bytes[i])
         capacities[index] -= 1
+    logger.info("DFlash2 KV pools: capacities=%s", capacities)
     return tuple(capacities)
 
 

@@ -3198,6 +3198,80 @@ def test_dflash_aligned_hybrid_uses_native_draft_pages():
     assert dflash_capacity >= target_capacity * 0.70
 
 
+def test_dflash_pools_hold_state_pages_for_every_sequence():
+    """Per-sequence Mamba and draft pools must admit max_num_seqs requests."""
+    num_spec = 4
+    target_block_size = 2160
+    target_page_size = target_block_size * 776
+    target_spec = FullAttentionSpec(
+        block_size=target_block_size,
+        num_kv_heads=1,
+        head_size=388,
+        dtype=torch.uint8,
+    )
+    mamba_spec = new_mamba_spec(
+        block_size=target_block_size,
+        shapes=((target_page_size,),),
+        dtypes=(torch.uint8,),
+        num_speculative_blocks=num_spec,
+        mamba_cache_mode="align",
+    )
+    draft_spec = new_sliding_window_spec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float16,
+        sliding_window=2048,
+    )
+    specs = {
+        **{f"model.layers.{i}.full_attn": target_spec for i in range(16)},
+        **{f"model.layers.{i}.linear_attn": mamba_spec for i in range(16, 64)},
+        **{f"model.layers.{i}.self_attn.attn": draft_spec for i in range(64, 69)},
+    }
+    config = _dflash_aligned_hybrid_grouping_config()
+    groups = get_kv_cache_groups(config, specs)
+    mamba_ids = [
+        i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    draft_ids = [
+        i
+        for i, g in enumerate(groups)
+        if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+    ]
+    assert mamba_ids and draft_ids
+
+    def single_request_pages(group):
+        spec = group.kv_cache_spec
+        return kv_cache_utils.cdiv(
+            spec.max_memory_usage_bytes(config), spec.page_size_bytes
+        )
+
+    # Budget exactly fits two sequences' state pages plus one max_model_len
+    # request of full attention, with every pool's null block.
+    two_seq_pages = [
+        max(single_request_pages(g), 2 * (2 + num_spec))
+        if i in mamba_ids
+        else 2 * single_request_pages(g)
+        if i in draft_ids
+        else single_request_pages(g)
+        for i, g in enumerate(groups)
+    ]
+    available_memory = sum(
+        (pages + 1) * kv_cache_utils._group_page_bytes(g)
+        for pages, g in zip(two_seq_pages, groups)
+    )
+
+    single = kv_cache_utils._dflash_group_capacities(config, groups, available_memory)
+    assert all(single[i] - 1 < 2 * (2 + num_spec) for i in mamba_ids)
+
+    config.scheduler_config.max_num_seqs = 2
+    double = kv_cache_utils._dflash_group_capacities(config, groups, available_memory)
+    assert all(double[i] - 1 >= 2 * (2 + num_spec) for i in mamba_ids)
+    assert all(
+        double[i] - 1 >= 2 * single_request_pages(groups[i]) for i in draft_ids
+    )
+
+
 def test_dflash_aligned_hybrid_identifies_local_draft_layer_names():
     """DFlash still separates the draft cache when its KV name is local."""
     target_block_size = 2160
