@@ -4615,6 +4615,11 @@ if method == "dflash":
         cfg["disable_eagle_block_drop"] = True
 if use_local_argmax in {"1", "true", "True", "yes", "on"}:
     cfg["use_local_argmax_reduction"] = True
+# Batch-size schedule for dynamic speculative decoding, e.g. [[1,1,7],[2,2,4]].
+if os.environ.get("SPECULATIVE_TOKENS_PER_BATCH_SIZE"):
+    cfg["num_speculative_tokens_per_batch_size"] = json.loads(
+        os.environ["SPECULATIVE_TOKENS_PER_BATCH_SIZE"]
+    )
 
 print(json.dumps(cfg, separators=(",", ":")))
 PY
@@ -4953,6 +4958,7 @@ build_args() {
 
   [[ -n "${QUANTIZATION:-}" ]] && VLLM_ARGS+=(--quantization "$QUANTIZATION")
   [[ -n "${KV_CACHE_DTYPE:-}" ]] && VLLM_ARGS+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+  [[ -n "${MAMBA_SSM_CACHE_DTYPE:-}" ]] && VLLM_ARGS+=(--mamba-ssm-cache-dtype "$MAMBA_SSM_CACHE_DTYPE")
   [[ -n "${MAMBA_CACHE_MODE:-}" ]] && VLLM_ARGS+=(--mamba-cache-mode "$MAMBA_CACHE_MODE")
   [[ "${ENFORCE_EAGER:-0}" == "1" ]] && VLLM_ARGS+=(--enforce-eager)
   [[ "${NO_ASYNC_SCHEDULING:-0}" == "1" ]] && VLLM_ARGS+=(--no-async-scheduling)
