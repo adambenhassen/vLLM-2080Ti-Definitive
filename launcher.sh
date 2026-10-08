@@ -6014,6 +6014,8 @@ check_checkpoint_mmap_policy() {
 }
 
 configure_automatic_prefill_batch_barrier() {
+  # An explicit PREFILL_BATCH_BARRIER=0|1 wins over the max-sequences default.
+  [[ "${PREFILL_BATCH_BARRIER:-}" == [01] ]] && return 0
   if [[ "${MAX_NUM_SEQS:-1}" =~ ^[1-9][0-9]*$ ]] && (( 10#$MAX_NUM_SEQS > 1 )); then
     PREFILL_BATCH_BARRIER=1
   else
