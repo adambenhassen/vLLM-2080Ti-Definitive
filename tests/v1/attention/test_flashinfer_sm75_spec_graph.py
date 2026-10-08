@@ -136,3 +136,14 @@ def test_sm75_spec_prefill_wrapper_reuses_graph_buffers(monkeypatch):
     assert concurrent_kwargs["paged_kv_indptr_buf"].shape == (3,)
     assert concurrent_kwargs["paged_kv_indices_buf"].shape == (32768,)
     assert concurrent_kwargs["paged_kv_last_page_len_buf"].shape == (2,)
+
+
+def test_sm75_spec_prefill_graph_query_lens_cover_dynamic_schedule():
+    """Every width a dynamic draft schedule verifies needs a stable wrapper."""
+    config = _config(capture_sizes=(8, 16), max_num_seqs=2)
+    assert flashinfer._sm75_spec_prefill_graph_query_lens(config, 8) == {8}
+    config.speculative_config.num_speculative_tokens_per_batch_size = [
+        [1, 1, 7],
+        [2, 2, 4],
+    ]
+    assert flashinfer._sm75_spec_prefill_graph_query_lens(config, 8) == {8, 5}

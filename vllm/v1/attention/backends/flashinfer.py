@@ -89,6 +89,7 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     iter_layer_specs,
 )
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.utils import CpuGpuBuffer
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
@@ -154,6 +155,32 @@ def _sm75_spec_prefill_graph_query_len(
         ):
             return None
     return query_len if found_attention else None
+
+
+def _sm75_spec_prefill_graph_query_lens(
+    vllm_config: VllmConfig, query_len: int
+) -> frozenset[int]:
+    """Speculative query widths that get FULL-graph-stable SM75 wrappers.
+
+    A dynamic draft schedule verifies fewer than num_speculative_tokens drafts
+    for some batch sizes, and the model runner captures uniform decode graphs
+    for each of those widths too. They must all plan into stable buffers: a
+    FULL graph replaying the generic prefill wrapper keeps reading the plan
+    buffers from capture time.
+    """
+    query_lens = {query_len}
+    speculative_config = vllm_config.speculative_config
+    schedule = getattr(
+        speculative_config, "num_speculative_tokens_per_batch_size", None
+    )
+    if schedule:
+        dense_schedule = build_dynamic_sd_schedule_lookup(
+            schedule,
+            vllm_max_batch_size=vllm_config.scheduler_config.max_num_seqs,
+            vllm_num_speculative_tokens=query_len - 1,
+        )
+        query_lens.update(num_spec + 1 for num_spec in dense_schedule[1:])
+    return frozenset(query_lens)
 
 
 def _flashinfer_workspace_buffer_size(
@@ -842,6 +869,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         max_num_pages = max_num_reqs * max_num_pages_per_req
         self._sm75_spec_query_len = _sm75_spec_prefill_graph_query_len(
             vllm_config, kv_cache_spec
+        )
+        self._sm75_spec_query_lens = (
+            _sm75_spec_prefill_graph_query_lens(vllm_config, self._sm75_spec_query_len)
+            if self._sm75_spec_query_len is not None
+            else frozenset()
         )
         self._sm75_spec_prefill_wrappers: dict[
             tuple[int, int, bool], BatchPrefillWithPagedKVCacheWrapper
@@ -1758,8 +1790,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
+                spec_query_len = common_attn_metadata.max_query_len
                 use_sm75_spec_graph_wrapper = (
-                    self._sm75_spec_query_len is not None
+                    spec_query_len in self._sm75_spec_query_lens
                     and common_prefix_len == 0
                     and bool(attn_metadata.causal)
                     and not self.use_dcp
@@ -1770,24 +1803,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and num_decodes == 0
                     and num_prefills == num_reqs
                     and 1 <= num_reqs <= self.max_num_reqs
-                    and num_prefill_tokens
-                    == self._sm75_spec_query_len * num_reqs
-                    and num_actual_tokens
-                    == self._sm75_spec_query_len * num_reqs
-                    and common_attn_metadata.max_query_len
-                    == self._sm75_spec_query_len
+                    and num_prefill_tokens == spec_query_len * num_reqs
+                    and num_actual_tokens == spec_query_len * num_reqs
                     and common_attn_metadata.query_start_loc_cpu.shape
                     == (num_reqs + 1,)
                     and common_attn_metadata.query_start_loc_cpu.tolist()
-                    == [
-                        self._sm75_spec_query_len * index
-                        for index in range(num_reqs + 1)
-                    ]
+                    == [spec_query_len * index for index in range(num_reqs + 1)]
                 )
                 if use_sm75_spec_graph_wrapper:
                     prefill_wrapper = self._get_sm75_spec_prefill_wrapper(
                         num_prefills,
-                        self._sm75_spec_query_len,
+                        spec_query_len,
                         bool(attn_metadata.causal),
                     )
                 else:
