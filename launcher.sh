@@ -4972,6 +4972,10 @@ build_args() {
     VLLM_ARGS+=(--kv-transfer-config "$(disk_kv_transfer_config)")
   fi
   [[ "${ENABLE_PROMPT_TOKENS_DETAILS:-1}" == "1" ]] && VLLM_ARGS+=(--enable-prompt-tokens-details)
+  # Per-request TTFT/ITL in responses (llama-swap prefill/decode columns); needs DISABLE_LOG_STATS=0.
+  [[ "${ENABLE_PER_REQUEST_METRICS:-0}" == "1" ]] && VLLM_ARGS+=(--enable-per-request-metrics)
+  # Usage in every streamed response, even when the client does not ask for it.
+  [[ "${ENABLE_FORCE_INCLUDE_USAGE:-0}" == "1" ]] && VLLM_ARGS+=(--enable-force-include-usage)
   [[ "${LANGUAGE_MODEL_ONLY:-0}" == "1" ]] && VLLM_ARGS+=(--language-model-only)
   [[ "${SKIP_MM_PROFILING:-0}" == "1" ]] && VLLM_ARGS+=(--skip-mm-profiling)
   if [[ -n "${CUSTOM_ALL_REDUCE_MODE:-}" ]]; then
