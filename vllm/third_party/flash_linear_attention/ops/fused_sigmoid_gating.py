@@ -108,11 +108,24 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
-            # Load state index and check for invalid entries
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                tl.int64
-            )
+            # Load state index and check for invalid entries. ``i_t`` comes from
+            # ``num_accepted_tokens - 1`` and is unbounded against the
+            # ``stride_indices_seq`` columns of this request's row: a zero count
+            # reads before the row, a stale or too-large one past it, and a
+            # garbage index would be dereferenced (vllm#50021). Mask the load to
+            # the row so an out-of-row read takes the invalid-state path.
+            idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
+            state_idx = tl.load(
+                ssm_state_indices + i_n * stride_indices_seq + i_t,
+                mask=idx_in_row,
+                other=null_block_id,
+            ).to(tl.int64)
             if state_idx < 0 or state_idx == null_block_id:
+                # Zero the output instead of leaving it uninitialized.
+                zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
+                for _ in range(0, T):
+                    tl.store(p_o, zero, mask=mask_v)
+                    p_o += HV * V
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
