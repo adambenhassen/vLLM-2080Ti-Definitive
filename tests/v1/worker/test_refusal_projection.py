@@ -182,3 +182,30 @@ def test_refusal_state_unknown_layout_uses_global(rp):
     # Adaptive verification: real token count below the CPU upper bound.
     state.fill(np.array([0]), np.array([4], dtype=np.int32), 2, 0.0)
     assert torch.all(rp._tok_buf == 0.0)
+
+
+def _chat(**extra):
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra}
+    return ChatCompletionRequest.model_validate(body)
+
+
+def test_chat_kwarg_maps_to_cache_salt(rp):
+    req = _chat(chat_template_kwargs={"refusal_lambda": 1, "reasoning_effort": "xhigh"})
+    assert req.cache_salt == "refusal:1.0"
+    assert rp.parse_request_lambda(req.cache_salt) == 1.0
+    # An explicit salt wins; no kwarg means no salt.
+    assert _chat(cache_salt="abc", chat_template_kwargs={"refusal_lambda": 1}).cache_salt == "abc"
+    assert _chat(chat_template_kwargs={"reasoning_effort": "low"}).cache_salt is None
+
+
+@pytest.mark.parametrize("bad", ["x", 9, float("nan")])
+def test_chat_kwarg_rejects_bad_lambda(rp, bad):
+    with pytest.raises(Exception, match="refusal_lambda"):
+        _chat(chat_template_kwargs={"refusal_lambda": bad})
+
+
+def test_chat_kwarg_ignored_without_dial(monkeypatch):
+    monkeypatch.delenv("VLLM_REFUSAL_DIRS", raising=False)
+    assert _chat(chat_template_kwargs={"refusal_lambda": 1}).cache_salt is None

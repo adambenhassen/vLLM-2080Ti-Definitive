@@ -41,6 +41,8 @@ from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.refusal_projection import SALT_PREFIX as REFUSAL_SALT_PREFIX
+from vllm.refusal_projection import is_enabled as refusal_is_enabled
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
     BeamSearchParams,
@@ -526,6 +528,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def check_cache_salt_support(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
+        # Clients that cannot send cache_salt (e.g. pi) select the refusal
+        # projection strength through chat_template_kwargs instead.
+        kwargs = data.get("chat_template_kwargs")
+        if (
+            data.get("cache_salt") is None
+            and isinstance(kwargs, dict)
+            and kwargs.get("refusal_lambda") is not None
+            and refusal_is_enabled()
+        ):
+            try:
+                lam = float(kwargs["refusal_lambda"])
+            except (TypeError, ValueError):
+                lam = float("nan")
+            # Same range as /admin/refusal_lambda; NaN fails the comparison.
+            if not -1.0 <= lam <= 4.0:
+                raise VLLMValidationError(
+                    "chat_template_kwargs.refusal_lambda must be a number "
+                    "between -1 and 4.",
+                    parameter="chat_template_kwargs",
+                )
+            data["cache_salt"] = f"{REFUSAL_SALT_PREFIX}{lam}"
         validate_cache_salt(data.get("cache_salt"))
         return data
 
