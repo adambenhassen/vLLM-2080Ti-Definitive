@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.refusal_projection import parse_request_lambda
 
 if TYPE_CHECKING:
     import numpy as np
@@ -48,6 +49,8 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    # Refusal projection strength from cache_salt="refusal:<float>".
+    refusal_lambda: float | None = None
 
     @classmethod
     def from_request(
@@ -73,6 +76,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            refusal_lambda=parse_request_lambda(request.cache_salt),
         )
 
     @property

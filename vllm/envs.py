@@ -319,6 +319,8 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_REFUSAL_DIRS: str | None = None
+    VLLM_REFUSAL_LAMBDA_INIT: float = 0.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2123,6 +2125,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
+    # Direction file for the runtime rank-1 refusal projection (Qwen3.5/3.8).
+    # Unset = no projection modules are built. Changes the compiled graph.
+    "VLLM_REFUSAL_DIRS": lambda: os.getenv("VLLM_REFUSAL_DIRS", None),
+    # Startup value of the projection's global lambda (0 = unmodified model).
+    "VLLM_REFUSAL_LAMBDA_INIT": lambda: float(
+        os.getenv("VLLM_REFUSAL_LAMBDA_INIT", "0.0")
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2342,6 +2351,8 @@ def compile_factors() -> dict[str, object]:
 
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        # Runtime tensor value, not graph structure.
+        "VLLM_REFUSAL_LAMBDA_INIT",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",

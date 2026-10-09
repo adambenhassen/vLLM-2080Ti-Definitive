@@ -240,6 +240,18 @@ class Worker(WorkerBase):
             )
         return self._sleep_mode_backend
 
+    def set_refusal_lambda(self, value: float) -> float:
+        from vllm.refusal_projection import set_lambda
+
+        applied = set_lambda(float(value))
+        logger.info("refusal lambda = %s (rank %s)", applied, self.rank)
+        return applied
+
+    def get_refusal_lambda(self) -> float:
+        from vllm.refusal_projection import get_lambda
+
+        return get_lambda()
+
     def sleep(self, level: int = 1) -> None:
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]

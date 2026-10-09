@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm import refusal_projection
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -143,6 +144,7 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
+from vllm.v1.worker.gpu.refusal_utils import RefusalState
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
     all_to_all_logits,
@@ -346,6 +348,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
+        self.refusal_state = RefusalState(
+            max_num_reqs=self.max_num_reqs,
+            max_num_tokens=self.max_num_tokens,
+            device=self.device,
+        )
         self.lora_capture_cases = [0]
         if self.lora_config:
             self.lora_capture_cases = get_lora_capture_cases(
@@ -1108,6 +1115,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
+        self.refusal_state.remove_request(req_idx)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -1179,6 +1187,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_index, new_req_data.block_ids, overwrite=True
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+            self.refusal_state.add_request(req_index, new_req_data.refusal_lambda)
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
@@ -1761,7 +1770,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.num_scheduled_tokens,
                 )
                 self._set_active_loras(*lora_inputs)
+            if refusal_projection.is_enabled():
+                self.refusal_state.fill(
+                    input_batch.idx_mapping_np,
+                    input_batch.num_scheduled_tokens,
+                    input_batch.num_tokens,
+                    refusal_projection.get_lambda(),
+                )
         else:
+            if refusal_projection.is_enabled():
+                self.refusal_state.fill_neutral(refusal_projection.get_lambda())
             # No actual tokens to run. A dummy run for DP or memory profiling.
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
             input_batch = InputBatch.make_dummy(

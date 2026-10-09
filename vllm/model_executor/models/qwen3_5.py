@@ -30,6 +30,7 @@ import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
+from vllm import refusal_projection
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -203,6 +204,26 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 ),
             )
 
+        self.refusal_attn: nn.Module | None = None
+        self.refusal_mlp: nn.Module | None = None
+        if refusal_projection.is_enabled():
+            attn_sub = (
+                "linear_attn.out_proj"
+                if self.layer_type == "linear_attention"
+                else "self_attn.o_proj"
+            )
+            device = self.input_layernorm.weight.device
+            got_attn = refusal_projection.resolve_direction(prefix, attn_sub)
+            got_mlp = refusal_projection.resolve_direction(prefix, "mlp.down_proj")
+            if got_attn is not None:
+                self.refusal_attn = refusal_projection.RefusalProjection(
+                    *got_attn, device=device
+                )
+            if got_mlp is not None:
+                self.refusal_mlp = refusal_projection.RefusalProjection(
+                    *got_mlp, device=device
+                )
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -259,6 +280,10 @@ class Qwen3_5Model(Qwen3NextModel):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        if refusal_projection.is_enabled() and (
+            self.start_layer == 0 and self.end_layer == config.num_hidden_layers
+        ):
+            refusal_projection.verify_all_consumed()
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
             Qwen3NextSparseMoeBlock,

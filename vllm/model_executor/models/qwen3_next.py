@@ -545,6 +545,10 @@ class Qwen3NextDecoderLayer(nn.Module):
                 ),
             )
 
+        # Set by Qwen3_5DecoderLayer when the runtime refusal projection is on.
+        self.refusal_attn: nn.Module | None = None
+        self.refusal_mlp: nn.Module | None = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -574,6 +578,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
 
+        if self.refusal_attn is not None:
+            hidden_states = self.refusal_attn(hidden_states)
+
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -601,6 +608,9 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
+
+        if self.refusal_mlp is not None:
+            hidden_states = self.refusal_mlp(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
