@@ -321,6 +321,7 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_REFUSAL_DIRS: str | None = None
     VLLM_REFUSAL_LAMBDA_INIT: float = 0.0
+    VLLM_MTP_DRAFT_VOCAB: str | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2132,6 +2133,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_REFUSAL_LAMBDA_INIT": lambda: float(
         os.getenv("VLLM_REFUSAL_LAMBDA_INIT", "0.0")
     ),
+    # JSON list of token ids for a vocab-truncated Qwen3.5/3.8 MTP draft head.
+    # Unset = the drafter scores the full lm_head.
+    "VLLM_MTP_DRAFT_VOCAB": lambda: os.getenv("VLLM_MTP_DRAFT_VOCAB", None),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2353,6 +2357,8 @@ def compile_factors() -> dict[str, object]:
         "MAX_JOBS",
         # Runtime tensor value, not graph structure.
         "VLLM_REFUSAL_LAMBDA_INIT",
+        # Draft head lives outside the compiled forward.
+        "VLLM_MTP_DRAFT_VOCAB",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",

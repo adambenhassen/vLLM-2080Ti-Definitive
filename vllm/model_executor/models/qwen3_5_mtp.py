@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
+import json
 import os
 from collections.abc import Iterable
 
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
@@ -270,9 +272,40 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
+
+        # Vocab-truncated draft head (VLLM_MTP_DRAFT_VOCAB): the drafter scores
+        # only the listed token ids instead of the full lm_head. Rejection
+        # sampling keeps the output exact; only acceptance can change.
+        self.draft_lm_head = None
+        draft_vocab = envs.VLLM_MTP_DRAFT_VOCAB
+        if draft_vocab and get_pp_group().is_last_rank:
+            with open(draft_vocab) as f:
+                ids = torch.tensor(json.load(f), dtype=torch.long, device="cpu")
+            if (
+                ids.ndim != 1
+                or ids.numel() == 0
+                or ids.unique().numel() != ids.numel()
+                or int(ids.min()) < 0
+                or int(ids.max()) >= config.vocab_size
+            ):
+                raise ValueError(
+                    f"VLLM_MTP_DRAFT_VOCAB={draft_vocab}: expected a list of "
+                    f"distinct token ids in [0, {config.vocab_size})"
+                )
+            self._draft_vocab_ids_cpu = ids
+            # Moved to the head's device in load_weights.
+            self.register_buffer("draft_vocab_ids", ids.clone(), persistent=False)
+            # The rows are sliced from the checkpoint's unquantized lm_head.
+            self.draft_lm_head = ParallelLMHead(
+                ids.numel(),
+                config.hidden_size,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "draft_lm_head"),
+            )
+            self.draft_logits_processor = LogitsProcessor(ids.numel())
+            logger.info(
+                "MTP drafter uses a %d-token draft head (%s)", ids.numel(), draft_vocab
+            )
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -331,7 +364,21 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
+        if self.draft_lm_head is not None:
+            sub = self.draft_logits_processor(self.draft_lm_head, hidden_states)
+            if sub is None:
+                return None
+            logits = sub.new_full((sub.shape[0], self.config.vocab_size), -float("inf"))
+            return logits.index_copy_(1, self.draft_vocab_ids, sub)
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.draft_lm_head is not None:
+            top = self.draft_logits_processor.get_top_tokens(
+                self.draft_lm_head, hidden_states
+            )
+            return self.draft_vocab_ids[top]
+        return super().get_top_tokens(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):
@@ -341,12 +388,27 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
                     if "embed_tokens" in name:
                         name = name.replace("language_model.", "")
+                    elif self.draft_lm_head is not None and name.endswith(
+                        "lm_head.weight"
+                    ):
+                        ids = self._draft_vocab_ids_cpu.to(weight.device)
+                        yield "draft_lm_head.weight", weight.index_select(0, ids)
                 else:
                     continue
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+        loaded = loader.load_weights(remap_weight_names(weights))
+        if self.draft_lm_head is not None:
+            if "draft_lm_head.weight" not in loaded:
+                raise ValueError(
+                    "VLLM_MTP_DRAFT_VOCAB needs an unquantized lm_head.weight in "
+                    "the checkpoint to slice the draft head from"
+                )
+            self.draft_vocab_ids = self.draft_vocab_ids.to(
+                self.draft_lm_head.weight.device
+            )
+        return loaded
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
