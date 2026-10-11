@@ -357,9 +357,14 @@ class CudaGraphManager:
         # draft tokens. The scheduler might use a smaller number so we need
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
+        # Only managers whose query spans the drafts (the target's verify, a
+        # DFlash drafter's block) follow the schedule. An autoregressive
+        # drafter's manager runs one token per step: the width arithmetic
+        # below would reach 0 for it.
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
+            and self.decode_query_len > self.vllm_config.num_speculative_tokens
         ):
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
             # _per_step. Recover num_new_sampled_tokens_per_step
