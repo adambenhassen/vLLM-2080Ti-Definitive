@@ -42,7 +42,10 @@ from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.hisparse.binding import release_hisparse_profiling_cache
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    build_dynamic_sd_schedule_lookup,
+    dflash_lookup_draft_block,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
@@ -377,6 +380,18 @@ class CudaGraphManager:
             )
         else:
             decode_query_lens = [self.decode_query_len]
+            # The DFlash2 lookup verifies the drafter's own block on steps without
+            # a running copy, so that width needs a decode graph too.
+            # (The drafter's own manager already captures that width only.)
+            lookup_block = dflash_lookup_draft_block(speculative_config)
+            if lookup_block is not None:
+                short_query_len = (
+                    lookup_block
+                    + self.decode_query_len
+                    - self.vllm_config.num_speculative_tokens
+                )
+                if 0 < short_query_len < self.decode_query_len:
+                    decode_query_lens.insert(0, short_query_len)
 
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode

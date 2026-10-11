@@ -157,3 +157,38 @@ def test_fuse_fills_tail_past_the_drafter_block(match_len, agree, want_tail_look
     assert bool(use[0, block:].all())
     tail_from_lookup = bool((draft[0, block:] == look[0, block:].long()).all())
     assert tail_from_lookup == want_tail_lookup
+
+
+def test_long_block_controller_needs_two_saturated_steps_then_holds(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+
+    monkeypatch.setenv("VLLM_DFLASH2_LOOKUP_STICKY", "3")
+    spec = SimpleNamespace(
+        _adaptive=True,
+        draft_block=7,
+        num_speculative_steps=15,
+        _flags_cpu=torch.zeros(1, dtype=torch.int32).pin_memory(),
+        _flags_n=0,
+        _prev_want=False,
+        _sticky=0,
+        _lookup_take=torch.zeros(1, dtype=torch.int32, device="cuda"),
+    )
+
+    def step(take, emitted):
+        spec._lookup_take.fill_(take)
+        spec.last_num_emitted = torch.tensor([emitted], device="cuda")
+        out = DFlash2Speculator.next_num_draft_tokens(spec)
+        torch.cuda.synchronize()  # let the pinned flag copy land
+        return out
+
+    # The decision reads the previous step's flags: two saturated steps with a
+    # tail to fill are needed before the long block is chosen.
+    got = [step(1, 8), step(1, 8), step(1, 16)]
+    assert got == [7, 7, 15]
+    # Flag drops out (nothing to fill): held for STICKY steps, then short.
+    got = [step(0, 16), step(0, 3), step(0, 3), step(0, 3), step(0, 3)]
+    assert got == [15, 15, 15, 15, 7]
+    # An unsaturated step never qualifies, even with a tail available.
+    assert [step(1, 5), step(1, 5), step(1, 5)] == [7, 7, 7]

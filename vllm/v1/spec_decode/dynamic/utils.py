@@ -146,3 +146,26 @@ def build_dynamic_sd_schedule_lookup(
         )
 
     return dense_schedule
+
+
+def dflash_lookup_draft_block(speculative_config: object) -> int | None:
+    """Draft tokens per step when the DFlash2 lookup lengthens the verify block.
+
+    With VLLM_DFLASH2_LOOKUP=1 and num_speculative_tokens above the drafter's
+    trained block (dflash_config.block_size - 1), the drafter keeps its trained
+    block and the lookup fills the rest of the verify block; steps without a
+    running copy verify only the drafter's block. Returns that block, or None
+    when every step verifies num_speculative_tokens.
+    """
+    import vllm.envs as envs
+
+    if speculative_config is None or not envs.VLLM_DFLASH2_LOOKUP:
+        return None
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    hf_config = getattr(draft_model_config, "hf_config", None)
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    trained_block = int(dflash_config.get("block_size", 0)) - 1
+    num_speculative_tokens = speculative_config.num_speculative_tokens
+    if 0 < trained_block < num_speculative_tokens:
+        return trained_block
+    return None

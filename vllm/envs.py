@@ -328,6 +328,7 @@ if TYPE_CHECKING:
     VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
     VLLM_DFLASH2_LOOKUP_AGREE: int = 0
     VLLM_DFLASH2_LOOKUP_SEARCH: int = 1 << 30
+    VLLM_DFLASH2_LOOKUP_STICKY: int = 3
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2163,6 +2164,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_SEARCH": lambda: int(
         os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30))
     ),
+    # Steps the long verify block is held after a copy run's flag drops out
+    # (single request only).
+    "VLLM_DFLASH2_LOOKUP_STICKY": lambda: int(
+        os.getenv("VLLM_DFLASH2_LOOKUP_STICKY", "3")
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2393,6 +2399,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DFLASH2_LOOKUP_NSTRONG",
         "VLLM_DFLASH2_LOOKUP_AGREE",
         "VLLM_DFLASH2_LOOKUP_SEARCH",
+        "VLLM_DFLASH2_LOOKUP_STICKY",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",

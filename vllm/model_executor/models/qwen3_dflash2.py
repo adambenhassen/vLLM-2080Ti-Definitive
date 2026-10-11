@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -16,6 +15,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.spec_decode.dynamic.utils import dflash_lookup_draft_block
 
 from .dflash2_sm75 import (
     Sm75DFlash2MLP,
@@ -310,10 +310,12 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         # lookup the drafter keeps its trained block while the target verifies a
         # longer one (DFlashSpeculator.draft_block); the convolution resets on this
         # boundary, so it must match the drafter's query layout.
-        query_block = 1 + speculative_config.num_speculative_tokens
-        trained_block = int(draft_config.get("block_size", 0))
-        if envs.VLLM_DFLASH2_LOOKUP and 0 < trained_block < query_block:
-            query_block = trained_block
+        lookup_block = dflash_lookup_draft_block(speculative_config)
+        query_block = 1 + (
+            speculative_config.num_speculative_tokens
+            if lookup_block is None
+            else lookup_block
+        )
         conv_args = dict(
             hidden_size=config.hidden_size,
             taps=int(draft_config["conv_kernel_size"]),

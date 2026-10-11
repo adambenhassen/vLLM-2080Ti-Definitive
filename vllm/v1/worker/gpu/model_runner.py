@@ -2224,9 +2224,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            num_draft = None
+            if self.speculator is not None and hasattr(
+                self.speculator, "next_num_draft_tokens"
+            ):
+                # The DFlash2 lookup verifies a long block only during a copy.
+                num_draft = self.speculator.next_num_draft_tokens()
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
+                num_draft=num_draft,
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(

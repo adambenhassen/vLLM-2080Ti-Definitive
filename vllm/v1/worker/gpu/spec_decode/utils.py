@@ -63,9 +63,16 @@ class DraftTokensHandler:
         self.num_draft_tokens: int = 0
 
     def set_draft_tokens(
-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+        self,
+        input_batch: InputBatch,
+        draft_tokens: torch.Tensor,
+        num_draft: int | None = None,
     ) -> None:
+        """num_draft: how many proposed tokens the scheduler verifies next step,
+        when the speculator wants fewer than it proposed (DFlash2 lookup)."""
         self.req_ids = input_batch.req_ids
+        if num_draft is not None:
+            draft_tokens = draft_tokens[:, :num_draft]
         self.num_draft_tokens = draft_tokens.shape[1]
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by

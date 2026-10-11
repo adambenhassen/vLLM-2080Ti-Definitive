@@ -89,7 +89,10 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     iter_layer_specs,
 )
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    build_dynamic_sd_schedule_lookup,
+    dflash_lookup_draft_block,
+)
 from vllm.v1.utils import CpuGpuBuffer
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
@@ -131,8 +134,14 @@ def _sm75_spec_prefill_graph_query_len(
     capture_sizes = {
         size for size in (compilation_config.cudagraph_capture_sizes or ()) if size > 0
     }
+    query_lens = {query_len}
+    lookup_block = dflash_lookup_draft_block(speculative_config)
+    if lookup_block is not None:
+        query_lens.add(lookup_block + 1)
     expected_capture_sizes = {
-        query_len * batch_size for batch_size in range(1, max_num_seqs + 1)
+        width * batch_size
+        for width in query_lens
+        for batch_size in range(1, max_num_seqs + 1)
     }
     if (
         capture_sizes != expected_capture_sizes
@@ -183,6 +192,10 @@ def _sm75_spec_prefill_graph_query_lens(
             vllm_num_speculative_tokens=query_len - 1,
         )
         query_lens.update(num_spec + 1 for num_spec in dense_schedule[1:])
+    # The DFlash2 lookup verifies the drafter's own block between copies.
+    lookup_block = dflash_lookup_draft_block(speculative_config)
+    if lookup_block is not None:
+        query_lens.add(lookup_block + 1)
     return frozenset(query_lens)
 
 

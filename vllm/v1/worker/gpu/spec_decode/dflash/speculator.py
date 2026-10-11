@@ -6,7 +6,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -18,6 +17,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_sliding_window,
 )
+from vllm.v1.spec_decode.dynamic.utils import dflash_lookup_draft_block
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot
@@ -53,23 +53,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
-        # The drafter emits the block its checkpoint was trained for
-        # (dflash_config.block_size - 1). With VLLM_DFLASH2_LOOKUP the target may
-        # verify a longer block, whose extra positions the lookup fills from the
-        # request's own tokens. The draft model's query layout uses draft_block; the
-        # proposal handed to the target uses num_speculative_steps.
-        trained_block = (
-            int(
-                (
-                    getattr(self.draft_model_config.hf_config, "dflash_config", None)
-                    or {}
-                ).get("block_size", 0)
-            )
-            - 1
-        )
+        # With the DFlash2 lookup the target may verify a longer block than the
+        # drafter's trained one; the lookup fills the extra positions. The draft
+        # model's query layout uses draft_block; the proposal handed to the target
+        # uses num_speculative_steps.
         self.draft_block = self.num_speculative_steps
-        if envs.VLLM_DFLASH2_LOOKUP and 0 < trained_block < self.num_speculative_steps:
-            self.draft_block = trained_block
+        lookup_block = dflash_lookup_draft_block(self.speculative_config)
+        if lookup_block is not None:
+            self.draft_block = lookup_block
             logger.info(
                 "%s: drafting %d tokens per step; the lookup fills the other %d of "
                 "%d verify positions.",
@@ -381,6 +372,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
+        # Tokens the step that just ran emitted per request (bonus + accepted);
+        # the DFlash2 lookup sizes the next verify block from it.
+        self.last_num_emitted = num_sampled[:num_reqs] - num_rejected[:num_reqs]
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()

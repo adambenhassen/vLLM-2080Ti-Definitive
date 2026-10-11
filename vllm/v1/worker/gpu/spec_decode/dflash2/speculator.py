@@ -177,6 +177,48 @@ class DFlash2Speculator(DFlashSpeculator):
                 envs.VLLM_DFLASH2_LOOKUP_AGREE,
                 envs.VLLM_DFLASH2_LOOKUP_SEARCH,
             )
+        # A verify block longer than the drafter's only pays while a copy is
+        # running, so it is chosen per step on the host (next_num_draft_tokens)
+        # from the previous step's fuse flags. They are read from a pinned copy
+        # that landed asynchronously: one step stale, never a synchronise.
+        self._adaptive = self._lookup and self.draft_block < k
+        self._flags_cpu = (
+            torch.zeros(self.max_num_reqs, dtype=torch.int32).pin_memory()
+            if self._adaptive
+            else None
+        )
+        self._flags_n = 0
+        self._prev_want = False
+        self._sticky = 0
+
+    def next_num_draft_tokens(self) -> int | None:
+        """How many proposed tokens the scheduler verifies next step (None = all).
+
+        Runs on the host once per step, outside the captured draft graph. The
+        long block costs step time on every request, so it takes a lookup with a
+        tail to fill on every request and two saturated steps in a row (a single
+        one happens inside ordinary prose); with one request it is then held for
+        VLLM_DFLASH2_LOOKUP_STICKY steps after the flag drops out."""
+        if not self._adaptive:
+            return None
+        emitted = getattr(self, "last_num_emitted", None)
+        if emitted is None:
+            return self.draft_block
+        assert self._flags_cpu is not None
+        num_reqs = emitted.shape[0]
+        want = bool(self._flags_n and self._flags_cpu[: self._flags_n].all())
+        fused = (self._lookup_take[:num_reqs] > 0) & (emitted >= 1 + self.draft_block)
+        self._flags_cpu[:num_reqs].copy_(fused.to(torch.int32), non_blocking=True)
+        self._flags_n = num_reqs
+        if want and self._prev_want:
+            long_block = True
+            self._sticky = envs.VLLM_DFLASH2_LOOKUP_STICKY if num_reqs == 1 else 0
+        elif self._sticky > 0 and num_reqs == 1:
+            long_block, self._sticky = True, self._sticky - 1
+        else:
+            long_block, self._sticky = False, 0
+        self._prev_want = want
+        return self.num_speculative_steps if long_block else self.draft_block
 
     def set_req_states(self, req_states) -> None:
         """The token history the lookup matches against (set by the model runner)."""
