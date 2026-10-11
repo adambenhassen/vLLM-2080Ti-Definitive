@@ -76,7 +76,7 @@ real benchmark or smoke result that proves the changed path still works.
 
 - Do not commit local caches, model weights, logs, temporary workspace state,
   run outputs, or generated native build artifacts.
-- Keep `README.md`, `README.zh-CN.md`, `CHANGELOG.md`, `VERSION`, and
-  `pyproject.toml` version fallback aligned for releases.
+- Keep `README.md`, `CHANGELOG.md`, `VERSION`, and `pyproject.toml` version
+  fallback aligned for releases.
 - Release tags and GitHub Releases are separate. Pushing a tag is not enough to
   update the GitHub Release page.
