@@ -21,6 +21,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import LocalArgmaxMixin, SupportsPP
@@ -295,11 +296,15 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             self._draft_vocab_ids_cpu = ids
             # Moved to the head's device in load_weights.
             self.register_buffer("draft_vocab_ids", ids.clone(), persistent=False)
-            # The rows are sliced from the checkpoint's unquantized lm_head.
+            # The rows are sliced from the checkpoint's lm_head, in its own format:
+            # packed rows and scales when the head is quantized.
+            lm_head_quantized = not isinstance(
+                self.lm_head.quant_method, UnquantizedEmbeddingMethod
+            )
             self.draft_lm_head = ParallelLMHead(
                 ids.numel(),
                 config.hidden_size,
-                quant_config=None,
+                quant_config=self.quant_config if lm_head_quantized else None,
                 prefix=maybe_prefix(prefix, "draft_lm_head"),
             )
             self.draft_logits_processor = LogitsProcessor(ids.numel())
@@ -388,11 +393,8 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
                     if "embed_tokens" in name:
                         name = name.replace("language_model.", "")
-                    elif self.draft_lm_head is not None and name.endswith(
-                        "lm_head.weight"
-                    ):
-                        ids = self._draft_vocab_ids_cpu.to(weight.device)
-                        yield "draft_lm_head.weight", weight.index_select(0, ids)
+                    elif self.draft_lm_head is not None and "lm_head." in name:
+                        yield self._draft_head_rows(name, weight)
                 else:
                     continue
                 yield name, weight
@@ -400,15 +402,32 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(remap_weight_names(weights))
         if self.draft_lm_head is not None:
-            if "draft_lm_head.weight" not in loaded:
+            if not any(n.startswith("draft_lm_head.") for n in loaded):
                 raise ValueError(
-                    "VLLM_MTP_DRAFT_VOCAB needs an unquantized lm_head.weight in "
-                    "the checkpoint to slice the draft head from"
+                    "VLLM_MTP_DRAFT_VOCAB needs the checkpoint's lm_head to slice "
+                    "the draft head from"
                 )
             self.draft_vocab_ids = self.draft_vocab_ids.to(
-                self.draft_lm_head.weight.device
+                next(self.draft_lm_head.parameters()).device
             )
         return loaded
+
+    def _draft_head_rows(
+        self, name: str, weight: torch.Tensor
+    ) -> tuple[str, torch.Tensor]:
+        """The draft head's copy of one lm_head tensor: its vocab rows, in the
+        checkpoint's format (dense weight, or packed int rows and group scales)."""
+        suffix = name.rsplit("lm_head.", 1)[1]
+        ids = self._draft_vocab_ids_cpu
+        if suffix == "weight_shape":
+            return "draft_lm_head.weight_shape", torch.tensor(
+                [ids.numel(), int(weight[1])], dtype=weight.dtype
+            )
+        if suffix not in ("weight", "weight_packed", "weight_scale"):
+            raise ValueError(
+                f"VLLM_MTP_DRAFT_VOCAB cannot slice lm_head tensor {name!r}"
+            )
+        return f"draft_lm_head.{suffix}", weight.index_select(0, ids.to(weight.device))
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
