@@ -118,7 +118,10 @@ def _sm75_spec_prefill_graph_query_len(
         or vllm_config.attention_config.use_non_causal
         or envs.VLLM_BATCH_INVARIANT
         or speculative_config is None
-        or not 1 <= speculative_config.num_speculative_tokens <= 7
+        # Without these wrappers a FULL graph replays the generic prefill wrapper
+        # with capture-time plan buffers, which corrupts every verify above 8
+        # query tokens (DFlash2 + lookup verifies 16).
+        or not 1 <= speculative_config.num_speculative_tokens <= 15
         or compilation_config.cudagraph_mode.decode_mode() != CUDAGraphMode.FULL
     ):
         return None
