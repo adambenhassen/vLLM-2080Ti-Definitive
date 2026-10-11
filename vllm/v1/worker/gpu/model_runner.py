@@ -323,6 +323,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        if self.speculator is not None and hasattr(self.speculator, "set_req_states"):
+            # Lookup-augmented drafting reads the request token history.
+            self.speculator.set_req_states(self.req_states)
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,

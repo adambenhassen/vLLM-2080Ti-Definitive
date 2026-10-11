@@ -5,11 +5,20 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
+    _point_mass_draft_logits_kernel,
+    fuse_draft,
+    suffix_lookup,
+)
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -129,6 +138,37 @@ class DFlash2Speculator(DFlashSpeculator):
         self._cached_candidate_ids = torch.zeros(
             self._selector_scores.shape, dtype=torch.int64, device=device
         )
+        # Lookup-augmented drafting (VLLM_DFLASH2_LOOKUP): fuse the continuation of
+        # an earlier occurrence of the current suffix into the drafted block.
+        self._lookup = envs.VLLM_DFLASH2_LOOKUP
+        self._req_states = None
+        k = self.num_speculative_steps
+        self._lookup_tokens = torch.zeros(
+            (self.max_num_reqs, k), dtype=torch.int32, device=device
+        )
+        self._lookup_len = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
+        self._lookup_valid = torch.zeros_like(self._lookup_len)
+        # Positions the lookup supplied: these get a point-mass draft distribution.
+        self._lookup_use = torch.zeros_like(self._lookup_tokens)
+        self._lookup_hits = torch.zeros((), dtype=torch.int64, device=device)
+        self._lookup_take = torch.zeros_like(self._lookup_len)
+        if self._lookup:
+            logger.info(
+                "DFlash2 lookup-augmented drafting on (k=%d nmin=%d nmax=%d "
+                "nstrong=%d agree=%d search=%d)",
+                k,
+                envs.VLLM_DFLASH2_LOOKUP_NMIN,
+                envs.VLLM_DFLASH2_LOOKUP_NMAX,
+                envs.VLLM_DFLASH2_LOOKUP_NSTRONG,
+                envs.VLLM_DFLASH2_LOOKUP_AGREE,
+                envs.VLLM_DFLASH2_LOOKUP_SEARCH,
+            )
+
+    def set_req_states(self, req_states) -> None:
+        """The token history the lookup matches against (set by the model runner)."""
+        self._req_states = req_states
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # fp32 so the walk and the rejection that checks it read the same
@@ -215,3 +255,63 @@ class DFlash2Speculator(DFlashSpeculator):
         self._sample_path(candidate_ids, scores, num_reqs)
         if self.draft_logits is not None:
             self._cache_draft_logits(candidate_ids, num_sample)
+        self._apply_lookup(num_reqs)
+
+    def _apply_lookup(self, num_reqs: int) -> None:
+        """Replace drafted tokens with the continuation of an earlier occurrence of
+        the current suffix where the match is strong enough. Every replaced position
+        gets a point-mass draft distribution, so rejection sampling stays exact.
+
+        Runs inside the captured draft graph: the Python checks are capture-time."""
+        if not self._lookup or self._req_states is None:
+            return
+        k = self.num_speculative_steps
+        tokens, match_len, valid = suffix_lookup(
+            self._req_states.all_token_ids.gpu,
+            self._req_states.total_len.gpu,
+            self.sample_idx_mapping,
+            num_reqs,
+            k,
+            idx_mapping_stride=k,
+            nmax=envs.VLLM_DFLASH2_LOOKUP_NMAX,
+            nmin=envs.VLLM_DFLASH2_LOOKUP_NMIN,
+            search_max=envs.VLLM_DFLASH2_LOOKUP_SEARCH,
+            out_tokens=self._lookup_tokens[:num_reqs],
+            out_len=self._lookup_len[:num_reqs],
+            out_valid=self._lookup_valid[:num_reqs],
+        )
+        fuse_draft(
+            self.draft_tokens[:num_reqs],
+            tokens,
+            match_len,
+            valid,
+            self._lookup_use[:num_reqs],
+            self.sample_idx_mapping,
+            self._lookup_hits,
+            num_reqs,
+            k,
+            idx_mapping_stride=k,
+            nmin=envs.VLLM_DFLASH2_LOOKUP_NMIN,
+            nstrong=envs.VLLM_DFLASH2_LOOKUP_NSTRONG,
+            agree_min=envs.VLLM_DFLASH2_LOOKUP_AGREE,
+            take_flags=self._lookup_take[:num_reqs],
+        )
+        draft_logits = self.draft_logits
+        if draft_logits is None:
+            return
+        block_k = triton.next_power_of_2(self.selector_top_k)
+        _point_mass_draft_logits_kernel[(num_reqs * k,)](
+            draft_logits,
+            self._cached_candidate_ids,
+            self.draft_tokens,
+            self.draft_tokens.stride(0),
+            self._lookup_use,
+            self.sample_idx_mapping,
+            k,
+            draft_logits.stride(0),
+            draft_logits.stride(1),
+            num_steps=k,
+            top_k=self.selector_top_k,
+            BLOCK_K=block_k,
+            num_warps=1,
+        )

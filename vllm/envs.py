@@ -322,6 +322,12 @@ if TYPE_CHECKING:
     VLLM_REFUSAL_DIRS: str | None = None
     VLLM_REFUSAL_LAMBDA_INIT: float = 0.0
     VLLM_MTP_DRAFT_VOCAB: str | None = None
+    VLLM_DFLASH2_LOOKUP: bool = False
+    VLLM_DFLASH2_LOOKUP_NMIN: int = 6
+    VLLM_DFLASH2_LOOKUP_NMAX: int = 12
+    VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
+    VLLM_DFLASH2_LOOKUP_AGREE: int = 0
+    VLLM_DFLASH2_LOOKUP_SEARCH: int = 1 << 30
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2136,6 +2142,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # JSON list of token ids for a vocab-truncated Qwen3.5/3.8 MTP draft head.
     # Unset = the drafter scores the full lm_head.
     "VLLM_MTP_DRAFT_VOCAB": lambda: os.getenv("VLLM_MTP_DRAFT_VOCAB", None),
+    # DFlash2 lookup-augmented drafting: propose the continuation of an earlier
+    # occurrence of the current suffix in the request's own tokens.
+    "VLLM_DFLASH2_LOOKUP": lambda: os.getenv("VLLM_DFLASH2_LOOKUP", "0") == "1",
+    # Shortest suffix match the lookup considers.
+    "VLLM_DFLASH2_LOOKUP_NMIN": lambda: int(os.getenv("VLLM_DFLASH2_LOOKUP_NMIN", "6")),
+    # Longest suffix match measured; longer prefers older matches over newer ones.
+    "VLLM_DFLASH2_LOOKUP_NMAX": lambda: int(
+        os.getenv("VLLM_DFLASH2_LOOKUP_NMAX", "12")
+    ),
+    # Match length that replaces the drafter's tokens without its agreement.
+    "VLLM_DFLASH2_LOOKUP_NSTRONG": lambda: int(
+        os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "6")
+    ),
+    # Leading tokens the drafter must share with a shorter match.
+    "VLLM_DFLASH2_LOOKUP_AGREE": lambda: int(
+        os.getenv("VLLM_DFLASH2_LOOKUP_AGREE", "0")
+    ),
+    # How many of the most recent tokens the lookup searches.
+    "VLLM_DFLASH2_LOOKUP_SEARCH": lambda: int(
+        os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30))
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2359,6 +2386,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_REFUSAL_LAMBDA_INIT",
         # Draft head lives outside the compiled forward.
         "VLLM_MTP_DRAFT_VOCAB",
+        # Drafting kernels run outside the compiled forward.
+        "VLLM_DFLASH2_LOOKUP",
+        "VLLM_DFLASH2_LOOKUP_NMIN",
+        "VLLM_DFLASH2_LOOKUP_NMAX",
+        "VLLM_DFLASH2_LOOKUP_NSTRONG",
+        "VLLM_DFLASH2_LOOKUP_AGREE",
+        "VLLM_DFLASH2_LOOKUP_SEARCH",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
