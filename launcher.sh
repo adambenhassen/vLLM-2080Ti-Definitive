@@ -4613,6 +4613,9 @@ if method == "dflash":
     # DFlash drafts from its own KV cache, so the EAGLE trailing prefix-cache block drop only costs cache hits.
     if os.environ.get("SPECULATIVE_DISABLE_EAGLE_BLOCK_DROP", "0") in {"1", "true", "True", "yes", "on"}:
         cfg["disable_eagle_block_drop"] = True
+elif draft_sample_method == "probabilistic":
+    # MTP samples its drafts at the request temperature instead of argmax.
+    cfg["draft_sample_method"] = draft_sample_method
 if use_local_argmax in {"1", "true", "True", "yes", "on"}:
     cfg["use_local_argmax_reduction"] = True
 # Batch-size schedule for dynamic speculative decoding, e.g. [[1,1,7],[2,2,4]].
