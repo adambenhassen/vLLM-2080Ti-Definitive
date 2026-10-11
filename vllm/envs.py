@@ -2386,8 +2386,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_REFUSAL_LAMBDA_INIT",
         # Draft head lives outside the compiled forward.
         "VLLM_MTP_DRAFT_VOCAB",
-        # Drafting kernels run outside the compiled forward.
-        "VLLM_DFLASH2_LOOKUP",
+        # Lookup thresholds are read by kernels outside the compiled forward.
+        # VLLM_DFLASH2_LOOKUP itself stays hashed: it sets the drafter's block.
         "VLLM_DFLASH2_LOOKUP_NMIN",
         "VLLM_DFLASH2_LOOKUP_NMAX",
         "VLLM_DFLASH2_LOOKUP_NSTRONG",

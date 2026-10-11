@@ -94,6 +94,7 @@ def _cache_draft_logits_kernel(
     draft_logits_stride_0,
     draft_logits_stride_1,
     num_steps: tl.constexpr,
+    cache_steps: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -103,7 +104,9 @@ def _cache_draft_logits_kernel(
     offsets = tl.arange(0, BLOCK_K)
     mask = (req_state >= 0) & (offsets < top_k)
     candidate_base = flat * top_k
-    cache_base = (req_state * num_steps + step) * top_k
+    # The candidate cache spans the whole verify block (cache_steps); the drafter
+    # fills its first num_steps rows and the lookup the rest.
+    cache_base = (req_state * cache_steps + step) * top_k
     old_token_ids = tl.load(cached_candidate_ptr + cache_base + offsets, mask=mask)
     logits_base = (
         draft_logits_ptr
@@ -128,15 +131,24 @@ class DFlash2Speculator(DFlashSpeculator):
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
+        # The selector walks the drafter's own block; the proposal handed to the
+        # target (draft_tokens, the candidate cache) spans the whole verify block.
+        self._selector_tokens = torch.zeros(
+            (self.max_num_reqs, self.draft_block),
+            dtype=self.draft_tokens.dtype,
+            device=device,
+        )
         self._selector_scores = torch.empty(
             self.max_num_reqs,
-            self.num_speculative_steps,
+            self.draft_block,
             self.selector_top_k,
             dtype=torch.float32,
             device=device,
         )
         self._cached_candidate_ids = torch.zeros(
-            self._selector_scores.shape, dtype=torch.int64, device=device
+            (self.max_num_reqs, self.num_speculative_steps, self.selector_top_k),
+            dtype=torch.int64,
+            device=device,
         )
         # Lookup-augmented drafting (VLLM_DFLASH2_LOOKUP): fuse the continuation of
         # an earlier occurrence of the current suffix into the drafted block.
@@ -190,9 +202,9 @@ class DFlash2Speculator(DFlashSpeculator):
             self.sample_idx_mapping,
             self.temperature,
             self.seeds,
-            self.draft_tokens,
+            self._selector_tokens,
             self._selector_scores,
-            num_steps=self.num_speculative_steps,
+            num_steps=self.draft_block,
             top_k=self.selector_top_k,
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=self.draft_logits is not None,
@@ -212,7 +224,8 @@ class DFlash2Speculator(DFlashSpeculator):
             self.sample_idx_mapping,
             draft_logits.stride(0),
             draft_logits.stride(1),
-            num_steps=self.num_speculative_steps,
+            num_steps=self.draft_block,
+            cache_steps=self.num_speculative_steps,
             top_k=self.selector_top_k,
             BLOCK_K=block_k,
             num_warps=1,
@@ -234,15 +247,15 @@ class DFlash2Speculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        num_sample = num_reqs * self.num_speculative_steps
+        num_sample = num_reqs * self.draft_block
         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
-            num_reqs, self.num_speculative_steps, -1
+            num_reqs, self.draft_block, -1
         )
         candidate_ids, unary_logits = self.model.compute_candidates(
             hidden_states.flatten(0, 1)
         )
         candidate_ids = candidate_ids.view(
-            num_reqs, self.num_speculative_steps, self.selector_top_k
+            num_reqs, self.draft_block, self.selector_top_k
         )
         unary_logits = unary_logits.view_as(candidate_ids)
         anchor_token_ids = self.input_buffers.input_ids[self._anchor_indices[:num_reqs]]
@@ -255,6 +268,9 @@ class DFlash2Speculator(DFlashSpeculator):
         self._sample_path(candidate_ids, scores, num_reqs)
         if self.draft_logits is not None:
             self._cache_draft_logits(candidate_ids, num_sample)
+        self.draft_tokens[:num_reqs, : self.draft_block].copy_(
+            self._selector_tokens[:num_reqs]
+        )
         self._apply_lookup(num_reqs)
 
     def _apply_lookup(self, num_reqs: int) -> None:
@@ -272,7 +288,7 @@ class DFlash2Speculator(DFlashSpeculator):
             self.sample_idx_mapping,
             num_reqs,
             k,
-            idx_mapping_stride=k,
+            idx_mapping_stride=self.draft_block,
             nmax=envs.VLLM_DFLASH2_LOOKUP_NMAX,
             nmin=envs.VLLM_DFLASH2_LOOKUP_NMIN,
             search_max=envs.VLLM_DFLASH2_LOOKUP_SEARCH,
@@ -290,7 +306,8 @@ class DFlash2Speculator(DFlashSpeculator):
             self._lookup_hits,
             num_reqs,
             k,
-            idx_mapping_stride=k,
+            draft_block=self.draft_block,
+            idx_mapping_stride=self.draft_block,
             nmin=envs.VLLM_DFLASH2_LOOKUP_NMIN,
             nstrong=envs.VLLM_DFLASH2_LOOKUP_NSTRONG,
             agree_min=envs.VLLM_DFLASH2_LOOKUP_AGREE,
@@ -307,7 +324,7 @@ class DFlash2Speculator(DFlashSpeculator):
             self.draft_tokens.stride(0),
             self._lookup_use,
             self.sample_idx_mapping,
-            k,
+            self.draft_block,
             draft_logits.stride(0),
             draft_logits.stride(1),
             num_steps=k,

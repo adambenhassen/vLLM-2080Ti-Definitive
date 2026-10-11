@@ -125,3 +125,35 @@ def test_point_mass_rewrites_only_lookup_positions():
     for step in (0, 2):
         assert torch.isfinite(draft_logits[1, step, 1:4]).all()
         assert cached[1, step].tolist() == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "match_len,agree,want_tail_lookup",
+    [(12, 0, True), (4, 0, False), (6, 3, True), (4, 1, False)],
+)
+def test_fuse_fills_tail_past_the_drafter_block(match_len, agree, want_tail_lookup):
+    k, block = 7, 3
+    draft = torch.arange(100, 100 + k, dtype=torch.int64, device="cuda").view(1, k)
+    look = torch.arange(200, 200 + k, dtype=torch.int32, device="cuda").view(1, k)
+    look[0, :agree] = draft[0, :agree].to(torch.int32)
+    use = torch.zeros((1, k), dtype=torch.int32, device="cuda")
+    fuse_draft(
+        draft,
+        look,
+        torch.tensor([match_len], dtype=torch.int32, device="cuda"),
+        torch.tensor([k], dtype=torch.int32, device="cuda"),
+        use,
+        torch.ones(k, dtype=torch.int32, device="cuda"),
+        torch.zeros((), dtype=torch.int64, device="cuda"),
+        1,
+        k,
+        draft_block=block,
+        idx_mapping_stride=block,
+        nmin=4,
+        nstrong=8,
+        agree_min=2,
+    )
+    # Tail positions always get a point mass: nothing else wrote their q.
+    assert bool(use[0, block:].all())
+    tail_from_lookup = bool((draft[0, block:] == look[0, block:].long()).all())
+    assert tail_from_lookup == want_tail_lookup

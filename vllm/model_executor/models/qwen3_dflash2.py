@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -305,12 +306,19 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         draft_config = config.dflash_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
+        # Query tokens per request: the bonus token plus the mask tokens. With the
+        # lookup the drafter keeps its trained block while the target verifies a
+        # longer one (DFlashSpeculator.draft_block); the convolution resets on this
+        # boundary, so it must match the drafter's query layout.
+        query_block = 1 + speculative_config.num_speculative_tokens
+        trained_block = int(draft_config.get("block_size", 0))
+        if envs.VLLM_DFLASH2_LOOKUP and 0 < trained_block < query_block:
+            query_block = trained_block
         conv_args = dict(
             hidden_size=config.hidden_size,
             taps=int(draft_config["conv_kernel_size"]),
             group_size=int(draft_config["conv_group_size"]),
-            # Query tokens per request: the bonus token plus the mask tokens.
-            block_size=1 + speculative_config.num_speculative_tokens,
+            block_size=query_block,
             params_dtype=vllm_config.model_config.dtype,
         )
         self.attention_conv = DFlashGroupedConv(
