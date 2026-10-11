@@ -330,6 +330,7 @@ if TYPE_CHECKING:
     VLLM_DFLASH2_LOOKUP_SEARCH: int = 1 << 30
     VLLM_DFLASH2_LOOKUP_STICKY: int = 3
     VLLM_CAPTURE_HIDDEN_STATES: str | None = None
+    VLLM_ENGINE_STALL_SENTINEL_S: float = 0.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2173,6 +2174,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Calibration: append every real token's final hidden state (lm_head input)
     # to this file, TP rank 0 only. Unset = off.
     "VLLM_CAPTURE_HIDDEN_STATES": lambda: os.getenv("VLLM_CAPTURE_HIDDEN_STATES", None),
+    # Warn when the engine core completes no step for this many seconds while
+    # requests are live. 0 (default) = off.
+    "VLLM_ENGINE_STALL_SENTINEL_S": lambda: float(
+        os.getenv("VLLM_ENGINE_STALL_SENTINEL_S", "0")
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2406,6 +2412,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DFLASH2_LOOKUP_STICKY",
         # Host-side file writes after the forward.
         "VLLM_CAPTURE_HIDDEN_STATES",
+        # Engine-core watchdog thread, not part of any graph.
+        "VLLM_ENGINE_STALL_SENTINEL_S",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",

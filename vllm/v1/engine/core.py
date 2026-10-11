@@ -102,6 +102,59 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+class _StallSentinel:
+    """Warns once per episode when the engine core stops completing steps while
+    requests are live (that failure logs nothing else: no stats line, no error).
+
+    Adapted from syv-ai/HyperQwen patches/engine-stall-sentinel.patch (Apache-2.0).
+    It reads the scheduler's request counts itself on each tick, so a core that
+    stopped stepping is reported against its current state. `_last_done` is a
+    plain float written only by the main loop: a lock here could take part in
+    the very stall it reports. Keyed on completed steps, so a long chunked
+    prefill (one step per chunk) never trips it.
+    """
+
+    def __init__(self, get_counts, threshold_s: float, check_interval_s: float = 5.0):
+        self._get_counts = get_counts
+        self._threshold_s = threshold_s
+        self._check_interval_s = check_interval_s
+        self._last_done = time.monotonic()
+        self._stall_logged = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="EngineCoreStallSentinel", daemon=True
+        )
+        self._thread.start()
+
+    def step_done(self) -> None:
+        self._last_done = time.monotonic()
+        self._stall_logged = False
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._check_interval_s):
+            gap = time.monotonic() - self._last_done
+            if gap < self._threshold_s or self._stall_logged:
+                continue
+            try:
+                running, waiting = self._get_counts()
+            except Exception:  # noqa: BLE001 - never kill the sentinel
+                continue
+            if running + waiting > 0:
+                self._stall_logged = True
+                logger.warning(
+                    "EngineCore stall: no completed step for %.0f s (threshold "
+                    "%.0f s) while %d running / %d waiting request(s) are live; "
+                    "the engine may have stopped stepping.",
+                    gap,
+                    self._threshold_s,
+                    running,
+                    waiting,
+                )
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -1090,6 +1143,19 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
+            # Optional stall sentinel (VLLM_ENGINE_STALL_SENTINEL_S, off by
+            # default). Built after super().__init__(), which creates the scheduler.
+            self._stall_sentinel: _StallSentinel | None = None
+            if envs.VLLM_ENGINE_STALL_SENTINEL_S > 0:
+                self._stall_sentinel = _StallSentinel(
+                    self.scheduler.get_request_counts,
+                    envs.VLLM_ENGINE_STALL_SENTINEL_S,
+                )
+                logger.info(
+                    "EngineCore stall sentinel enabled (threshold %.0f s)",
+                    envs.VLLM_ENGINE_STALL_SENTINEL_S,
+                )
+
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
                 vllm_config.parallel_config.enable_fault_tolerance
@@ -1467,6 +1533,8 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        if self._stall_sentinel is not None:
+            self._stall_sentinel.step_done()
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
