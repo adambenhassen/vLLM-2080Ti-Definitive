@@ -37,6 +37,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -2027,6 +2028,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states = None
             aux_hidden_states = None
             output_intermediate_tensors = model_output
+
+        if (
+            envs.VLLM_CAPTURE_HIDDEN_STATES
+            and hidden_states is not None
+            and not dummy_run
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            # Calibration capture: append each real token's final hidden state (the
+            # lm_head input) as raw rows of the model dtype.
+            with open(envs.VLLM_CAPTURE_HIDDEN_STATES, "ab") as f:
+                hidden_states[: input_batch.num_tokens].cpu().numpy().tofile(f)
 
         routed_experts = None
         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
